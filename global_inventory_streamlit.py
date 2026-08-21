@@ -3,25 +3,66 @@ from __future__ import annotations
 import calendar
 import hashlib
 import io
+import math
 import re
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional
+from zoneinfo import ZoneInfo
+from zipfile import BadZipFile
 
 import streamlit as st
 from openpyxl import Workbook, load_workbook
+from openpyxl.utils.exceptions import InvalidFileException
 from openpyxl.formatting.rule import CellIsRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+MAX_SOURCE_ROWS = 200_000
+MAX_VALIDATION_MESSAGES = 100
+KST = ZoneInfo("Asia/Seoul")
+MISSING_MARKERS = {"-", "N/A", "NA", "NONE", "NULL", "UNKNOWN", "미확인", "미정"}
 
 
 class InputFormatError(ValueError):
     """입력 엑셀의 시트 또는 필수 열 구조가 예상과 다를 때 발생한다."""
+
+
+class DataValidationError(ValueError):
+    """입력 데이터가 업무 규칙상 안전하게 처리될 수 없을 때 발생한다."""
+
+
+@dataclass
+class ValidationSummary:
+    source_rows: int = 0
+    selected_rows: int = 0
+    kept_rows: int = 0
+    source_quantity: float = 0
+    kept_quantity: float = 0
+    missing_expiry_rows: int = 0
+    missing_master_rows: int = 0
+    missing_lot_rows: int = 0
+    missing_product_name_rows: int = 0
+    zero_quantity_rows: int = 0
+    master_rows: int = 0
+    master_blank_barcode_rows: int = 0
+    master_blank_months_rows: int = 0
+    master_match_rows: int = 0
+    product_name_conflicts: int = 0
+    warnings: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.warnings is None:
+            self.warnings = []
+
+    @property
+    def master_match_ratio(self) -> float:
+        return self.master_match_rows / self.selected_rows if self.selected_rows else 0.0
 
 
 @dataclass(frozen=True)
@@ -62,6 +103,35 @@ def normalize_code(value: Any) -> str:
     if text.endswith(".0") and text[:-2].isdigit():
         return text[:-2]
     return text
+
+
+def today_kst() -> date:
+    return datetime.now(KST).date()
+
+
+def is_blank(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def is_missing_marker(value: Any) -> bool:
+    return isinstance(value, str) and value.strip().upper() in MISSING_MARKERS
+
+
+def is_formula(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith("=")
+
+
+def row_value(row: tuple[Any, ...], index: int) -> Any:
+    return row[index] if index < len(row) else None
+
+
+def write_safe_text(cell, value: Any) -> None:
+    """업로드 데이터의 문자열이 엑셀 수식으로 재해석되지 않도록 텍스트로 기록한다."""
+    if value is None:
+        cell.value = None
+    else:
+        cell.value = str(value)
+        cell.data_type = "s"
 
 
 def normalize_header(value: Any) -> str:
@@ -108,33 +178,50 @@ def find_required_columns(ws, required_headers: dict[str, str]) -> dict[str, int
 
 
 def parse_months(value: Any) -> Optional[float]:
-    if value in (None, ""):
+    if is_blank(value) or is_missing_marker(value):
         return None
+    if isinstance(value, bool) or is_formula(value):
+        raise ValueError("숫자 값이 아닙니다")
     if isinstance(value, (int, float)):
         months = float(value)
-        return months if months > 0 else None
-    match = re.search(r"\d+(?:\.\d+)?", str(value))
-    if not match:
-        return None
-    months = float(match.group())
-    return months if months > 0 else None
+    else:
+        text = str(value).strip().replace(",", "")
+        year_match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*년", text)
+        month_match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(?:개월|개월간|month(?:s)?)?", text, re.I)
+        if year_match:
+            months = float(year_match.group(1)) * 12
+        elif month_match:
+            months = float(month_match.group(1))
+        else:
+            raise ValueError("개월 수 형식이 아닙니다")
+    if not math.isfinite(months) or months <= 0 or months > 120:
+        raise ValueError("사용기한은 0 초과 120개월 이하여야 합니다")
+    return months
 
 
 def safe_number(value: Any) -> float | int | None:
-    if value in (None, ""):
+    if is_blank(value):
         return None
-    if isinstance(value, (int, float)):
-        return value
+    if isinstance(value, bool) or is_formula(value):
+        raise ValueError("숫자 값이 아닙니다")
     try:
-        number = float(str(value).replace(",", "").strip())
-        return int(number) if number.is_integer() else number
-    except ValueError:
-        return None
+        number = float(value) if isinstance(value, (int, float)) else float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("숫자 형식이 아닙니다") from exc
+    if not math.isfinite(number):
+        raise ValueError("유한한 숫자가 아닙니다")
+    if number < 0:
+        raise ValueError("음수 재고는 허용되지 않습니다")
+    if not number.is_integer():
+        raise ValueError("재고수량은 정수여야 합니다")
+    return int(number)
 
 
 def to_date_only(value: Any) -> Optional[date]:
-    if value in (None, ""):
+    if is_blank(value) or is_missing_marker(value):
         return None
+    if isinstance(value, bool) or is_formula(value):
+        raise ValueError("날짜 값이 아닙니다")
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):
@@ -142,18 +229,55 @@ def to_date_only(value: Any) -> Optional[date]:
     if isinstance(value, (int, float)):
         from openpyxl.utils.datetime import from_excel
 
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError("유한한 날짜 값이 아닙니다")
+        if number.is_integer() and 19000101 <= int(number) <= 21001231:
+            try:
+                return datetime.strptime(str(int(number)), "%Y%m%d").date()
+            except ValueError as exc:
+                raise ValueError("YYYYMMDD 날짜가 올바르지 않습니다") from exc
         try:
             converted = from_excel(value)
             return converted.date() if isinstance(converted, datetime) else converted
-        except Exception:
-            return None
+        except Exception as exc:
+            raise ValueError("엑셀 날짜 일련번호가 올바르지 않습니다") from exc
     text = str(value).strip()
-    for fmt in ("%Y-%m-%d", "%Y.%m.%d", "%Y/%m/%d", "%m/%d/%Y", "%m-%d-%Y"):
+    korean = re.fullmatch(r"(\d{4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일?", text)
+    if korean:
         try:
-            return datetime.strptime(text, fmt).date()
+            return date(int(korean.group(1)), int(korean.group(2)), int(korean.group(3)))
+        except ValueError as exc:
+            raise ValueError("한글 날짜가 올바르지 않습니다") from exc
+    normalized = text.replace("T", " ").removesuffix("Z")
+    for fmt in (
+        "%Y%m%d", "%Y-%m-%d", "%Y.%m.%d", "%Y/%m/%d",
+        "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S",
+        "%m/%d/%Y", "%m-%d-%Y",
+    ):
+        try:
+            return datetime.strptime(normalized, fmt).date()
         except ValueError:
             continue
-    return None
+    raise ValueError("지원하지 않는 날짜 형식입니다")
+
+
+def add_months(start: date, months: int) -> date:
+    year = start.year + (start.month - 1 + months) // 12
+    month = (start.month - 1 + months) % 12 + 1
+    day = min(start.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def calculate_remaining_ratio(expiry: date, base: date, lifetime_months: float) -> float:
+    integer_months = int(lifetime_months)
+    if float(lifetime_months).is_integer():
+        denominator = (add_months(base, integer_months) - base).days
+    else:
+        denominator = round(lifetime_months * 365.2425 / 12)
+    if denominator <= 0:
+        raise ValueError("사용기한으로 계산한 일수가 0 이하입니다")
+    return (expiry - base).days / denominator
 
 
 def parse_filename_date(filename: str, fallback_year: int) -> Optional[date]:
@@ -184,7 +308,10 @@ def read_existing_base_date(pantos_bytes: bytes) -> Optional[date]:
     try:
         for sheet_name in ("글로벌", "글로벌 유통기한", "글로벌유통기한"):
             if sheet_name in wb.sheetnames:
-                candidate = to_date_only(wb[sheet_name]["G1"].value)
+                try:
+                    candidate = to_date_only(wb[sheet_name]["G1"].value)
+                except ValueError:
+                    candidate = None
                 if candidate:
                     return candidate
         return None
@@ -210,13 +337,17 @@ def resolve_base_date(
         if existing:
             return existing, "입력 파일 기존 글로벌 시트 G1", filename_date
 
-    source_date = filename_date or date.today()
+    source_date = filename_date or today_kst()
     source_text = "파일명 날짜 자동 계산" if filename_date else "파일명 날짜 없음 → 오늘 날짜 자동 계산"
     return auto_base_date(source_date, split_day), source_text, filename_date
 
 
-def load_lifetime_months(master_bytes: bytes, settings: Settings) -> dict[str, Optional[float]]:
-    wb = load_workbook(io.BytesIO(master_bytes), data_only=True, read_only=True)
+def load_lifetime_months(
+    master_bytes: bytes,
+    settings: Settings,
+    summary: ValidationSummary,
+) -> dict[str, Optional[float]]:
+    wb = load_workbook(io.BytesIO(master_bytes), data_only=False, read_only=True)
     try:
         if settings.master_sheet not in wb.sheetnames:
             raise InputFormatError(
@@ -232,17 +363,44 @@ def load_lifetime_months(master_bytes: bytes, settings: Settings) -> dict[str, O
             },
         )
         mapping: dict[str, Optional[float]] = {}
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            barcode = normalize_code(row[cols["barcode"]] if len(row) > cols["barcode"] else None)
-            months = parse_months(row[cols["months"]] if len(row) > cols["months"] else None)
-            if not barcode:
+        errors: list[str] = []
+        for row_number, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+            if row_number - 1 > MAX_SOURCE_ROWS:
+                raise InputFormatError(f"Product Master는 최대 {MAX_SOURCE_ROWS:,}행까지 처리할 수 있습니다.")
+            summary.master_rows += 1
+            raw_barcode = row_value(row, cols["barcode"])
+            raw_months = row_value(row, cols["months"])
+            if is_formula(raw_barcode):
+                errors.append(f"마스터 {row_number}행: 바코드가 수식입니다. 값으로 붙여넣어 주세요.")
                 continue
+            barcode = normalize_code(raw_barcode)
+            if not barcode:
+                summary.master_blank_barcode_rows += 1
+                continue
+            if isinstance(raw_barcode, (int, float)) and not isinstance(raw_barcode, bool) and abs(raw_barcode) >= 10**15:
+                errors.append(f"마스터 {row_number}행: 15자리 초과 숫자 바코드는 엑셀 정밀도 손실 위험이 있습니다. 텍스트로 저장해 주세요.")
+                continue
+            try:
+                months = parse_months(raw_months)
+            except ValueError as exc:
+                errors.append(f"마스터 {row_number}행 바코드 {barcode}: 개봉 전 사용기한 오류 ({exc})")
+                if len(errors) >= MAX_VALIDATION_MESSAGES:
+                    break
+                continue
+            if months is None:
+                summary.master_blank_months_rows += 1
             if barcode in mapping and mapping[barcode] != months:
-                raise InputFormatError(
-                    f"Product Master 바코드 {barcode}에 서로 다른 개봉 전 사용기한이 "
-                    f"중복 등록되어 있습니다: {mapping[barcode]} / {months}"
+                errors.append(
+                    f"마스터 바코드 {barcode}: 서로 다른 사용기한 중복 ({mapping[barcode]} / {months})"
                 )
+                if len(errors) >= MAX_VALIDATION_MESSAGES:
+                    break
+                continue
             mapping[barcode] = months
+        if errors:
+            raise DataValidationError("Product Master 데이터 오류:\n- " + "\n- ".join(errors))
+        if not mapping:
+            raise DataValidationError("Product Master에서 사용할 수 있는 바코드를 찾지 못했습니다.")
         return mapping
     finally:
         wb.close()
@@ -253,8 +411,9 @@ def build_source_rows(
     lifetime_map: dict[str, Optional[float]],
     base: date,
     settings: Settings,
+    summary: ValidationSummary,
 ) -> tuple[list[dict], list[dict]]:
-    wb = load_workbook(io.BytesIO(pantos_bytes), data_only=True, read_only=True)
+    wb = load_workbook(io.BytesIO(pantos_bytes), data_only=False, read_only=True)
     try:
         if settings.stock_sheet not in wb.sheetnames:
             raise InputFormatError(
@@ -278,22 +437,92 @@ def build_source_rows(
         global_rows: list[dict] = []
         filtered_rows: list[dict] = []
         allowed = set(settings.locations)
+        seen_locations: set[str] = set()
+        errors: list[str] = []
+        names_by_material: dict[str, set[str]] = defaultdict(set)
 
         for row_number, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-            location = str(row[cols["location"]] or "").strip().upper()
+            if row_number - 1 > MAX_SOURCE_ROWS:
+                raise InputFormatError(f"판토스 원본은 최대 {MAX_SOURCE_ROWS:,}행까지 처리할 수 있습니다.")
+            summary.source_rows += 1
+            raw_location = row_value(row, cols["location"])
+            if is_formula(raw_location):
+                errors.append(f"판토스 {row_number}행: 창고 코드가 수식입니다. 값으로 붙여넣어 주세요.")
+                if len(errors) >= MAX_VALIDATION_MESSAGES:
+                    break
+                continue
+            location = str(raw_location or "").strip().upper()
+            if location:
+                seen_locations.add(location)
             if location not in allowed:
                 continue
 
-            material = normalize_code(row[cols["material"]])
-            product_name = row[cols["product_name"]]
-            available_stock = safe_number(row[cols["available_stock"]])
-            expiry = to_date_only(row[cols["expiry"]])
-            lot_no = row[cols["lot_no"]]
+            summary.selected_rows += 1
+            raw_material = row_value(row, cols["material"])
+            raw_product_name = row_value(row, cols["product_name"])
+            raw_stock = row_value(row, cols["available_stock"])
+            raw_expiry = row_value(row, cols["expiry"])
+            raw_lot = row_value(row, cols["lot_no"])
+
+            if is_formula(raw_material):
+                errors.append(f"판토스 {row_number}행: 자재코드가 수식입니다. 값으로 붙여넣어 주세요.")
+                continue
+            material = normalize_code(raw_material)
+            if not material:
+                errors.append(f"판토스 {row_number}행: 자재코드가 비어 있습니다.")
+                continue
+            if isinstance(raw_material, (int, float)) and not isinstance(raw_material, bool) and abs(raw_material) >= 10**15:
+                errors.append(f"판토스 {row_number}행: 15자리 초과 숫자 자재코드는 텍스트로 저장해 주세요.")
+                continue
+
+            if is_formula(raw_product_name):
+                errors.append(f"판토스 {row_number}행 자재 {material}: 제품명이 수식입니다. 값으로 붙여넣어 주세요.")
+                if len(errors) >= MAX_VALIDATION_MESSAGES:
+                    break
+                continue
+            if is_formula(raw_lot):
+                errors.append(f"판토스 {row_number}행 자재 {material}: LOT가 수식입니다. 값으로 붙여넣어 주세요.")
+                if len(errors) >= MAX_VALIDATION_MESSAGES:
+                    break
+                continue
+
+            try:
+                available_stock = safe_number(raw_stock)
+            except ValueError as exc:
+                errors.append(f"판토스 {row_number}행 자재 {material}: 가용재고 오류 ({exc})")
+                if len(errors) >= MAX_VALIDATION_MESSAGES:
+                    break
+                continue
+            if available_stock is None:
+                errors.append(f"판토스 {row_number}행 자재 {material}: 가용재고가 비어 있습니다.")
+                if len(errors) >= MAX_VALIDATION_MESSAGES:
+                    break
+                continue
+
+            try:
+                expiry = to_date_only(raw_expiry)
+            except ValueError as exc:
+                errors.append(f"판토스 {row_number}행 자재 {material}: 유통기한 오류 ({raw_expiry!r}, {exc})")
+                if len(errors) >= MAX_VALIDATION_MESSAGES:
+                    break
+                continue
+
+            product_name = None if is_blank(raw_product_name) else str(raw_product_name).strip()
+            lot_no = None if is_blank(raw_lot) or is_missing_marker(raw_lot) else normalize_lot_number(raw_lot)
+            if lot_no and re.search(r"[,;\n\r]", lot_no):
+                errors.append(
+                    f"판토스 {row_number}행 자재 {material}: 복수 LOT로 보이는 값({lot_no!r})은 "
+                    "LOT별 수량을 확인할 수 없어 처리할 수 없습니다. LOT별 행으로 분리해 주세요."
+                )
+                if len(errors) >= MAX_VALIDATION_MESSAGES:
+                    break
+                continue
+
             lifetime = lifetime_map.get(material)
 
             ratio = None
             if expiry and lifetime:
-                ratio = (expiry - base).days / ((lifetime / 12) * 365)
+                ratio = calculate_remaining_ratio(expiry, base, lifetime)
 
             if expiry is None:
                 status = "유지(유통기한 없음)" if settings.keep_missing_expiry else "제외(유통기한 없음)"
@@ -319,8 +548,63 @@ def build_source_rows(
                 "원본 행": row_number,
             }
             global_rows.append(item)
+            summary.source_quantity += available_stock
+            if expiry is None:
+                summary.missing_expiry_rows += 1
+            if lifetime is None:
+                summary.missing_master_rows += 1
+            else:
+                summary.master_match_rows += 1
+            if not lot_no:
+                summary.missing_lot_rows += 1
+            if not product_name:
+                summary.missing_product_name_rows += 1
+            else:
+                names_by_material[material].add(product_name)
+            if available_stock == 0:
+                summary.zero_quantity_rows += 1
             if keep:
                 filtered_rows.append(item)
+                summary.kept_quantity += available_stock
+
+        if errors:
+            suffix = "\n- 오류가 더 있을 수 있습니다." if len(errors) >= MAX_VALIDATION_MESSAGES else ""
+            raise DataValidationError("판토스 데이터 오류:\n- " + "\n- ".join(errors) + suffix)
+        if not global_rows:
+            raise DataValidationError(
+                "선택한 창고에 처리할 재고 행이 없습니다. 원본 창고 코드와 대상 창고 입력을 확인해 주세요."
+            )
+        if summary.master_match_rows == 0 and any(item["유통기한"] is not None for item in global_rows):
+            raise DataValidationError(
+                "유통기한이 입력된 재고가 있지만 Product Master와 매칭된 행이 0건입니다. "
+                "자재·바코드 형식과 파일 조합을 확인해 주세요."
+            )
+
+        summary.kept_rows = len(filtered_rows)
+        requested_missing = [location for location in settings.locations if location not in seen_locations]
+        if requested_missing:
+            summary.warnings.append("원본에 없는 선택 창고: " + ", ".join(requested_missing))
+        summary.product_name_conflicts = sum(len(names) > 1 for names in names_by_material.values())
+        if summary.product_name_conflicts:
+            examples = [
+                f"{material} ({' / '.join(sorted(names)[:3])})"
+                for material, names in names_by_material.items() if len(names) > 1
+            ][:10]
+            summary.warnings.append(
+                f"동일 자재코드의 제품명 불일치 {summary.product_name_conflicts:,}건: " + "; ".join(examples)
+            )
+        if summary.missing_expiry_rows:
+            summary.warnings.append(
+                f"유통기한 공란 {summary.missing_expiry_rows:,}행은 설정에 따라 "
+                f"{'유지' if settings.keep_missing_expiry else '제외'}되었습니다."
+            )
+        if summary.missing_master_rows:
+            summary.warnings.append(
+                f"마스터 사용기한 미매칭/공란 {summary.missing_master_rows:,}행은 설정에 따라 "
+                f"{'유지' if settings.keep_missing_master else '제외'}되었습니다."
+            )
+        if summary.master_match_ratio < 0.5:
+            summary.warnings.append(f"마스터 매칭률이 {summary.master_match_ratio:.1%}로 낮습니다. 파일 조합을 확인해 주세요.")
 
         return global_rows, filtered_rows
     finally:
@@ -398,22 +682,15 @@ def write_data_sheet(
     ]
     ws.append(headers)
     for row_index, item in enumerate(rows, start=2):
-        ws.append([
-            item["저장 위치"], item["자재"], item["자재내역"], item["가용재고(ASN)"],
-            item["유통기한"], item["로트번호(생산)"], None,
-            item["개봉 전 사용기한(개월)"], None,
-        ])
-        ws.cell(row_index, 7).value = (
-            f'=IF(OR(E{row_index}="",H{row_index}="",H{row_index}<=0),"",'
-            f'(E{row_index}-\'기준_자동화\'!$B$4)/((H{row_index}/12)*365))'
-        )
-        missing_expiry_result = "유지(유통기한 없음)" if settings.keep_missing_expiry else "제외(유통기한 없음)"
-        missing_master_result = "유지(마스터 누락)" if settings.keep_missing_master else "제외(마스터 누락)"
-        ws.cell(row_index, 9).value = (
-            f'=IF(E{row_index}="","{missing_expiry_result}",'
-            f'IF(OR(H{row_index}="",H{row_index}<=0),"{missing_master_result}",'
-            f'IF(G{row_index}>={settings.pass_threshold},"통과","제외")))'
-        )
+        write_safe_text(ws.cell(row_index, 1), item["저장 위치"])
+        write_safe_text(ws.cell(row_index, 2), item["자재"])
+        write_safe_text(ws.cell(row_index, 3), item["자재내역"])
+        ws.cell(row_index, 4).value = item["가용재고(ASN)"]
+        ws.cell(row_index, 5).value = item["유통기한"]
+        write_safe_text(ws.cell(row_index, 6), item["로트번호(생산)"])
+        ws.cell(row_index, 7).value = item["잔여 유통기한율"]
+        ws.cell(row_index, 8).value = item["개봉 전 사용기한(개월)"]
+        write_safe_text(ws.cell(row_index, 9), item["판정"])
 
     apply_standard_style(ws, len(headers))
     for col, width in {
@@ -444,25 +721,26 @@ def write_data_sheet(
         ws.auto_filter.ref = "A1:I1"
 
 
-def aggregate_by_product(rows: Iterable[dict]) -> dict[tuple[str, Any], dict]:
-    grouped: dict[tuple[str, Any], dict] = {}
+def aggregate_by_product(rows: Iterable[dict]) -> dict[str, dict]:
+    grouped: dict[str, dict] = {}
     for item in rows:
-        key = (item["자재"], item["자재내역"])
+        key = item["자재"]
         if key not in grouped:
             grouped[key] = {
                 "자재": item["자재"],
                 "자재내역": item["자재내역"],
                 "qty": defaultdict(float),
             }
+        elif not grouped[key]["자재내역"] and item["자재내역"]:
+            grouped[key]["자재내역"] = item["자재내역"]
         grouped[key]["qty"][item["저장 위치"]] += item["가용재고(ASN)"] or 0
     return grouped
 
 
-def product_sort_key(key: tuple[str, Any]):
-    material = key[0]
+def product_sort_key(material: str):
     if str(material).isdigit():
-        return 0, int(material), str(key[1])
-    return 1, str(material), str(key[1])
+        return 0, int(material)
+    return 1, str(material)
 
 
 def write_pivot_sheet(wb: Workbook, rows: list[dict], settings: Settings) -> None:
@@ -475,8 +753,8 @@ def write_pivot_sheet(wb: Workbook, rows: list[dict], settings: Settings) -> Non
     start_row = 3
     for row_number, key in enumerate(sorted(grouped, key=product_sort_key), start=start_row):
         item = grouped[key]
-        ws.cell(row_number, 1).value = item["자재"]
-        ws.cell(row_number, 2).value = item["자재내역"]
+        write_safe_text(ws.cell(row_number, 1), item["자재"])
+        write_safe_text(ws.cell(row_number, 2), item["자재내역"])
         total = 0.0
         for column, location in enumerate(settings.locations, start=3):
             quantity = item["qty"].get(location, 0)
@@ -525,7 +803,7 @@ def aggregate_location_exp_rows(rows: list[dict], location: str, settings: Setti
             continue
         lot_no = normalize_lot_number(item["로트번호(생산)"])
         key = (
-            item["자재"], item["자재내역"], item["유통기한"], lot_no,
+            item["자재"], item["유통기한"], lot_no,
             item["잔여 유통기한율"], item["개봉 전 사용기한(개월)"],
         )
         if key not in grouped:
@@ -538,6 +816,8 @@ def aggregate_location_exp_rows(rows: list[dict], location: str, settings: Setti
                 "개봉 전 사용기한(개월)": item["개봉 전 사용기한(개월)"],
                 "로트번호(생산)": lot_no,
             }
+        elif not grouped[key]["자재내역"] and item["자재내역"]:
+            grouped[key]["자재내역"] = item["자재내역"]
         grouped[key]["수량"] += quantity
 
     result = list(grouped.values())
@@ -571,12 +851,14 @@ def write_location_sheets(wb: Workbook, rows: list[dict], settings: Settings) ->
         detail_rows = aggregate_location_exp_rows(rows, location, settings)
         for item in detail_rows:
             quantity = item["수량"]
-            ws.append([
-                item["자재"], item["자재내역"],
-                int(quantity) if float(quantity).is_integer() else quantity,
-                item["EXP"], item["잔여 유통기한율"],
-                item["개봉 전 사용기한(개월)"], item["로트번호(생산)"],
-            ])
+            row_index = ws.max_row + 1
+            write_safe_text(ws.cell(row_index, 1), item["자재"])
+            write_safe_text(ws.cell(row_index, 2), item["자재내역"])
+            ws.cell(row_index, 3).value = int(quantity) if float(quantity).is_integer() else quantity
+            ws.cell(row_index, 4).value = item["EXP"]
+            ws.cell(row_index, 5).value = item["잔여 유통기한율"]
+            ws.cell(row_index, 6).value = item["개봉 전 사용기한(개월)"]
+            write_safe_text(ws.cell(row_index, 7), item["로트번호(생산)"])
         total_row = ws.max_row + 1
         ws.cell(total_row, 1).value = "총합계"
         ws.cell(total_row, 3).value = sum((ws.cell(r, 3).value or 0) for r in range(2, total_row))
@@ -594,8 +876,9 @@ def write_location_sheets(wb: Workbook, rows: list[dict], settings: Settings) ->
         for cell in ws["F"]:
             cell.number_format = "0"
         if detail_rows:
-            safe_location = re.sub(r"[^A-Za-z0-9_]", "", location) or "LOC"
-            add_table(ws, f"{safe_location}ExpTable", f"A1:G{total_row - 1}")
+            safe_location = re.sub(r"[^A-Za-z0-9_]", "", location)[:16] or "LOC"
+            suffix = hashlib.sha1(location.encode("utf-8")).hexdigest()[:8]
+            add_table(ws, f"T_{safe_location}_{suffix}", f"A1:G{total_row - 1}")
             ws.conditional_formatting.add(
                 f"E2:E{total_row - 1}",
                 CellIsRule(
@@ -618,6 +901,7 @@ def write_meta_sheet(
     global_rows: list[dict],
     filtered_rows: list[dict],
     settings: Settings,
+    summary: ValidationSummary,
 ) -> None:
     ws = wb.create_sheet("기준_자동화")
     counts = defaultdict(int)
@@ -645,6 +929,9 @@ def write_meta_sheet(
         )],
         ["글로벌 행 수", len(global_rows)],
         ["글로벌 유통기한 행 수", len(filtered_rows)],
+        ["선택 창고 전체 수량", summary.source_quantity],
+        ["유지 결과 수량", summary.kept_quantity],
+        ["마스터 매칭률", summary.master_match_ratio],
         ["원본 창고별 행 수", " / ".join(f"{loc} {counts[loc]:,}" for loc in settings.locations)],
         ["유지 창고별 행 수", " / ".join(f"{loc} {pass_counts[loc]:,}" for loc in settings.locations)],
         ["주의: 유통기한 없음", sum(item["유통기한"] is None for item in global_rows)],
@@ -665,9 +952,88 @@ def write_meta_sheet(
     ws.column_dimensions["B"].width = 90
     ws["B4"].number_format = "yyyy-mm-dd"
     ws["B6"].number_format = "yyyy-mm-dd"
+    ws["B16"].number_format = "0.0%"
     for row in ws.iter_rows(min_row=2, max_col=2):
         for cell in row:
             cell.alignment = Alignment(vertical="center", wrap_text=True)
+
+
+def write_validation_sheet(wb: Workbook, summary: ValidationSummary) -> None:
+    ws = wb.create_sheet("검증결과")
+    rows = [
+        ["검증 항목", "결과"],
+        ["판토스 전체 원본 행", summary.source_rows],
+        ["선택 창고 처리 행", summary.selected_rows],
+        ["결과 유지 행", summary.kept_rows],
+        ["선택 창고 전체 수량", summary.source_quantity],
+        ["결과 유지 수량", summary.kept_quantity],
+        ["마스터 전체 행", summary.master_rows],
+        ["마스터 빈 바코드 행", summary.master_blank_barcode_rows],
+        ["마스터 사용기한 공란 행", summary.master_blank_months_rows],
+        ["재고 마스터 매칭 행", summary.master_match_rows],
+        ["재고 마스터 매칭률", summary.master_match_ratio],
+        ["유통기한 공란 행", summary.missing_expiry_rows],
+        ["마스터 미매칭/공란 행", summary.missing_master_rows],
+        ["LOT 공란 행", summary.missing_lot_rows],
+        ["제품명 공란 행", summary.missing_product_name_rows],
+        ["0재고 행", summary.zero_quantity_rows],
+        ["동일 자재 제품명 불일치", summary.product_name_conflicts],
+        ["오류 검증", "통과"],
+    ]
+    for row in rows:
+        ws.append(row)
+    warning_start = ws.max_row + 2
+    ws.cell(warning_start, 1).value = "주의사항"
+    ws.cell(warning_start, 2).value = "내용"
+    for warning in summary.warnings or ["없음"]:
+        ws.append(["주의", warning])
+    apply_standard_style(ws, 2)
+    for cell in ws[warning_start]:
+        cell.fill = PatternFill("solid", fgColor="BF9000")
+        cell.font = Font(name="맑은 고딕", bold=True, color="FFFFFF", size=10)
+    ws.column_dimensions["A"].width = 32
+    ws.column_dimensions["B"].width = 100
+    ws["B11"].number_format = "0.0%"
+    for row in ws.iter_rows(min_row=2, max_col=2):
+        for cell in row:
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+
+
+def validate_output_workbook(
+    output_bytes: bytes,
+    global_rows: list[dict],
+    filtered_rows: list[dict],
+    settings: Settings,
+) -> None:
+    expected_sheets = [
+        "글로벌", "글로벌 유통기한", "글로벌 pv",
+        *(f"글로벌 유통기한 {location}" for location in settings.locations),
+        "검증결과", "기준_자동화",
+    ]
+    wb = load_workbook(io.BytesIO(output_bytes), data_only=True, read_only=True)
+    try:
+        if wb.sheetnames != expected_sheets:
+            raise RuntimeError("출력 시트 구성이 예상과 다릅니다.")
+        if wb["글로벌"].max_row - 1 != len(global_rows):
+            raise RuntimeError("글로벌 시트 행 수 검증에 실패했습니다.")
+        if wb["글로벌 유통기한"].max_row - 1 != len(filtered_rows):
+            raise RuntimeError("글로벌 유통기한 시트 행 수 검증에 실패했습니다.")
+
+        expected_total = sum(item["가용재고(ASN)"] for item in filtered_rows)
+        pivot = wb["글로벌 pv"]
+        pivot_total = pivot.cell(pivot.max_row, 3 + len(settings.locations)).value or 0
+        detail_total = 0
+        for location in settings.locations:
+            ws = wb[f"글로벌 유통기한 {location}"]
+            detail_total += ws.cell(ws.max_row, 3).value or 0
+        if not math.isclose(float(pivot_total), float(expected_total), abs_tol=1e-9):
+            raise RuntimeError("피벗 총수량 대사에 실패했습니다.")
+        if not math.isclose(float(detail_total), float(expected_total), abs_tol=1e-9):
+            raise RuntimeError("창고별 상세 총수량 대사에 실패했습니다.")
+        if global_rows and (wb["글로벌"]["G2"].value != global_rows[0]["잔여 유통기한율"]):
+            raise RuntimeError("잔여 유통기한율 저장값 검증에 실패했습니다.")
+    finally:
+        wb.close()
 
 
 def create_inventory_workbook(
@@ -679,9 +1045,10 @@ def create_inventory_workbook(
     base_source: str,
     filename_date: Optional[date],
     settings: Settings,
-) -> tuple[bytes, list[dict], list[dict]]:
-    lifetime_map = load_lifetime_months(master_bytes, settings)
-    global_rows, filtered_rows = build_source_rows(pantos_bytes, lifetime_map, base, settings)
+) -> tuple[bytes, list[dict], list[dict], ValidationSummary]:
+    summary = ValidationSummary()
+    lifetime_map = load_lifetime_months(master_bytes, settings, summary)
+    global_rows, filtered_rows = build_source_rows(pantos_bytes, lifetime_map, base, settings, summary)
 
     wb = Workbook()
     wb.remove(wb.active)
@@ -689,32 +1056,27 @@ def create_inventory_workbook(
     write_data_sheet(wb, "글로벌 유통기한", filtered_rows, settings, "GlobalExpiryDataTable")
     write_pivot_sheet(wb, filtered_rows, settings)
     write_location_sheets(wb, filtered_rows, settings)
+    write_validation_sheet(wb, summary)
     write_meta_sheet(
         wb, pantos_name, master_name, base, base_source, filename_date,
-        global_rows, filtered_rows, settings,
+        global_rows, filtered_rows, settings, summary,
     )
-    order = [
-        "글로벌", "글로벌 유통기한", "글로벌 pv",
-        *(f"글로벌 유통기한 {location}" for location in settings.locations),
-        "기준_자동화",
-    ]
-    wb._sheets = [wb[name] for name in order]
-    try:
-        wb.calculation.fullCalcOnLoad = True
-        wb.calculation.forceFullCalc = True
-        wb.calculation.calcMode = "auto"
-    except Exception:
-        pass
     output = io.BytesIO()
     wb.save(output)
     wb.close()
-    return output.getvalue(), global_rows, filtered_rows
+    output_bytes = output.getvalue()
+    validate_output_workbook(output_bytes, global_rows, filtered_rows, settings)
+    return output_bytes, global_rows, filtered_rows, summary
 
 
 def parse_locations(text: str) -> tuple[str, ...]:
     locations: list[str] = []
-    for token in re.split(r"[,>\s]+", text.upper().strip()):
+    for token in re.split(r"[,>→\s]+", text.upper().strip()):
         if token and token not in locations:
+            if not re.fullmatch(r"[A-Z0-9_-]{1,12}", token):
+                raise ValueError(
+                    f"창고 코드 '{token}'가 올바르지 않습니다. 영문, 숫자, 밑줄, 하이픈만 사용할 수 있습니다."
+                )
             locations.append(token)
     if not locations:
         raise ValueError("대상 창고를 하나 이상 입력해 주세요.")
@@ -729,7 +1091,8 @@ def sanitize_output_name(value: str) -> str:
         name = "글로벌재고_자동생성.xlsx"
     if not name.lower().endswith(".xlsx"):
         name += ".xlsx"
-    return name
+    stem = name[:-5].rstrip(". ")[:175] or "글로벌재고_자동생성"
+    return stem + ".xlsx"
 
 
 def result_signature(
@@ -754,7 +1117,7 @@ def render_sidebar() -> dict[str, Any]:
     with st.sidebar:
         st.header("생성 기준")
         base_mode = st.radio("기준일", ["자동", "직접 지정"], horizontal=True)
-        manual_date = st.date_input("직접 기준일", value=date.today(), disabled=base_mode != "직접 지정")
+        manual_date = st.date_input("직접 기준일", value=today_kst(), disabled=base_mode != "직접 지정")
         threshold_percent = st.number_input(
             "잔여 유통기한 통과율 (%)", min_value=0.0, max_value=100.0,
             value=66.0, step=1.0,
@@ -774,7 +1137,7 @@ def render_sidebar() -> dict[str, Any]:
         with st.expander("자동 기준일 상세"):
             fallback_year = st.number_input(
                 "파일명이 MMDD일 때 연도", min_value=2000, max_value=2100,
-                value=date.today().year, step=1,
+                value=today_kst().year, step=1,
             )
             split_day = st.number_input(
                 "전반기 기준일", min_value=1, max_value=28, value=15, step=1,
@@ -838,6 +1201,15 @@ def main() -> None:
     pantos_bytes = pantos_file.getvalue()
     master_bytes = master_file.getvalue()
 
+    oversized = []
+    if len(pantos_bytes) > MAX_UPLOAD_BYTES:
+        oversized.append(f"판토스 파일 ({len(pantos_bytes) / 1024 / 1024:.1f}MB)")
+    if len(master_bytes) > MAX_UPLOAD_BYTES:
+        oversized.append(f"Product Master ({len(master_bytes) / 1024 / 1024:.1f}MB)")
+    if oversized:
+        st.error(f"파일당 최대 크기는 {MAX_UPLOAD_BYTES / 1024 / 1024:.0f}MB입니다: " + ", ".join(oversized))
+        return
+
     try:
         locations = parse_locations(controls["location_text"])
         base, base_source, filename_date = resolve_base_date(
@@ -865,8 +1237,11 @@ def main() -> None:
         current_signature = result_signature(
             pantos_bytes, master_bytes, pantos_file.name, master_file.name, base, settings
         )
-    except (ValueError, InputFormatError) as exc:
-        st.error(str(exc))
+    except (BadZipFile, InvalidFileException, OSError, ValueError, TypeError, InputFormatError) as exc:
+        st.error(f"업로드 파일 또는 설정을 확인해 주세요: {exc}")
+        return
+    except Exception as exc:
+        st.error(f"업로드 파일을 확인할 수 없습니다: {type(exc).__name__}: {exc}")
         return
 
     a, b, c = st.columns(3)
@@ -874,11 +1249,25 @@ def main() -> None:
     b.metric("통과율", f"{settings.pass_threshold:.0%}")
     c.metric("창고 순서", " → ".join(settings.locations))
     st.caption(f"기준일 출처: {base_source}")
+    if base_source == "입력 파일 기존 글로벌 시트 G1" and filename_date:
+        filename_base = auto_base_date(filename_date, controls["split_day"])
+        if filename_base != base:
+            st.warning(
+                f"기존 G1 기준일({base:%Y-%m-%d})과 파일명 자동 기준일({filename_base:%Y-%m-%d})이 다릅니다."
+            )
+    elif filename_date is None and controls["base_mode"] == "자동":
+        st.warning("파일명에서 날짜를 찾지 못해 한국시간 오늘 날짜로 기준일을 계산했습니다.")
 
-    if st.button("재고 파일 만들기", type="primary", use_container_width=True):
+    confirmation_key = f"base_confirmed_{base.isoformat()}_{hashlib.sha1(base_source.encode()).hexdigest()[:8]}"
+    base_confirmed = st.checkbox(
+        f"기준일 {base:%Y-%m-%d}을 확인했습니다.",
+        key=confirmation_key,
+    )
+
+    if st.button("재고 파일 만들기", type="primary", width="stretch", disabled=not base_confirmed):
         try:
             with st.spinner("재고 데이터를 처리하고 있습니다..."):
-                output_bytes, global_rows, filtered_rows = create_inventory_workbook(
+                output_bytes, global_rows, filtered_rows, summary = create_inventory_workbook(
                     pantos_bytes=pantos_bytes,
                     master_bytes=master_bytes,
                     pantos_name=pantos_file.name,
@@ -892,11 +1281,15 @@ def main() -> None:
                 "bytes": output_bytes,
                 "global_count": len(global_rows),
                 "filtered_count": len(filtered_rows),
+                "source_quantity": summary.source_quantity,
+                "filtered_quantity": summary.kept_quantity,
+                "master_match_ratio": summary.master_match_ratio,
+                "warnings": summary.warnings,
                 "base": base,
                 "preview": filtered_rows[:100],
                 "signature": current_signature,
             }
-        except (InputFormatError, ValueError, KeyError, TypeError) as exc:
+        except (InputFormatError, DataValidationError, ValueError, KeyError, TypeError) as exc:
             st.error(f"입력 파일을 처리할 수 없습니다: {exc}")
             return
         except Exception as exc:
@@ -909,13 +1302,19 @@ def main() -> None:
             f"완료: 전체 {result['global_count']:,}행 중 "
             f"{result['filtered_count']:,}행이 유통기한 결과에 반영되었습니다."
         )
+        q1, q2, q3 = st.columns(3)
+        q1.metric("선택 창고 전체 수량", f"{result['source_quantity']:,.0f}")
+        q2.metric("결과 유지 수량", f"{result['filtered_quantity']:,.0f}")
+        q3.metric("마스터 매칭률", f"{result['master_match_ratio']:.1%}")
+        for warning in result.get("warnings", []):
+            st.warning(warning)
         st.download_button(
             "결과 엑셀 다운로드",
             data=result["bytes"],
             file_name=sanitize_output_name(output_name),
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         )
         with st.expander("결과 미리보기 (최대 100행)"):
             preview = []
@@ -930,7 +1329,7 @@ def main() -> None:
                     "잔여율": item["잔여 유통기한율"],
                     "판정": item["판정"],
                 })
-            st.dataframe(preview, use_container_width=True, hide_index=True)
+            st.dataframe(preview, width="stretch", hide_index=True)
 
 
 if __name__ == "__main__":
