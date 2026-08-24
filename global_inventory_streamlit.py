@@ -1291,7 +1291,7 @@ def render_sidebar() -> dict[str, Any]:
 
             with st.expander("입력 시트·열 이름"):
                 stock_sheet = st.text_input("판토스 원본 시트", value="Sheet1")
-                master_sheet = st.text_input("Product Master 시트", value="유효기간")
+                master_sheet = st.text_input("Product Master 시트", value="FG (제조 발주)")
                 st.caption("판토스 열 제목은 1행, Product Master 열 제목은 12행에서 인식합니다.")
                 location_col = st.text_input("창고 열", value="저장 위치")
                 material_col = st.text_input("자재 열", value="자재")
