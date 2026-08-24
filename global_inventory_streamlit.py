@@ -6,25 +6,27 @@ import io
 import math
 import re
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional
 from zoneinfo import ZoneInfo
-from zipfile import BadZipFile
+from zipfile import BadZipFile, ZipFile
 
 import streamlit as st
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
 from openpyxl.formatting.rule import CellIsRule
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.styles import Alignment, Border, Font, NamedStyle, PatternFill, Side
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.4.0"
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_SOURCE_ROWS = 200_000
 MAX_VALIDATION_MESSAGES = 100
+STOCK_HEADER_ROW = 1
+MASTER_HEADER_ROW = 12
 KST = ZoneInfo("Asia/Seoul")
 MISSING_MARKERS = {"-", "N/A", "NA", "NONE", "NULL", "UNKNOWN", "미확인", "미정"}
 
@@ -54,11 +56,9 @@ class ValidationSummary:
     master_blank_months_rows: int = 0
     master_match_rows: int = 0
     product_name_conflicts: int = 0
-    warnings: list[str] | None = None
-
-    def __post_init__(self) -> None:
-        if self.warnings is None:
-            self.warnings = []
+    warnings: list[str] = field(default_factory=list)
+    location_rows: dict[str, int] = field(default_factory=dict)
+    kept_location_rows: dict[str, int] = field(default_factory=dict)
 
     @property
     def master_match_ratio(self) -> float:
@@ -148,9 +148,17 @@ def normalize_lot_number(value: Any) -> str:
     return str(value).strip()
 
 
-def find_required_columns(ws, required_headers: dict[str, str]) -> dict[str, int]:
+def find_required_columns(
+    ws,
+    required_headers: dict[str, str],
+    header_row: int = 1,
+) -> dict[str, int]:
     normalized_to_indexes: dict[str, list[int]] = defaultdict(list)
-    for index, cell in enumerate(ws[1]):
+    header_cells = next(
+        ws.iter_rows(min_row=header_row, max_row=header_row),
+        (),
+    )
+    for index, cell in enumerate(header_cells):
         normalized_to_indexes[normalize_header(cell.value)].append(index)
 
     result: dict[str, int] = {}
@@ -172,7 +180,8 @@ def find_required_columns(ws, required_headers: dict[str, str]) -> dict[str, int
         if duplicated:
             details.append(f"중복 열: {', '.join(duplicated)}")
         raise InputFormatError(
-            f"'{ws.title}' 시트의 필수 열 구조가 올바르지 않습니다. " + " / ".join(details)
+            f"'{ws.title}' 시트 {header_row}행의 필수 열 구조가 올바르지 않습니다. "
+            + " / ".join(details)
         )
     return result
 
@@ -303,6 +312,7 @@ def auto_base_date(file_date: date, split_day: int) -> date:
     return date(file_date.year, file_date.month, last_day)
 
 
+@st.cache_data(show_spinner=False, max_entries=8)
 def read_existing_base_date(pantos_bytes: bytes) -> Optional[date]:
     wb = load_workbook(io.BytesIO(pantos_bytes), data_only=True, read_only=True)
     try:
@@ -361,11 +371,16 @@ def load_lifetime_months(
                 "barcode": settings.columns.master_barcode,
                 "months": settings.columns.master_months,
             },
+            header_row=MASTER_HEADER_ROW,
         )
         mapping: dict[str, Optional[float]] = {}
         errors: list[str] = []
-        for row_number, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-            if row_number - 1 > MAX_SOURCE_ROWS:
+        master_data_row = MASTER_HEADER_ROW + 1
+        for row_number, row in enumerate(
+            ws.iter_rows(min_row=master_data_row, values_only=True),
+            start=master_data_row,
+        ):
+            if row_number - MASTER_HEADER_ROW > MAX_SOURCE_ROWS:
                 raise InputFormatError(f"Product Master는 최대 {MAX_SOURCE_ROWS:,}행까지 처리할 수 있습니다.")
             summary.master_rows += 1
             raw_barcode = row_value(row, cols["barcode"])
@@ -432,6 +447,7 @@ def build_source_rows(
                 "expiry": c.expiry,
                 "lot_no": c.lot_no,
             },
+            header_row=STOCK_HEADER_ROW,
         )
 
         global_rows: list[dict] = []
@@ -441,8 +457,12 @@ def build_source_rows(
         errors: list[str] = []
         names_by_material: dict[str, set[str]] = defaultdict(set)
 
-        for row_number, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-            if row_number - 1 > MAX_SOURCE_ROWS:
+        stock_data_row = STOCK_HEADER_ROW + 1
+        for row_number, row in enumerate(
+            ws.iter_rows(min_row=stock_data_row, values_only=True),
+            start=stock_data_row,
+        ):
+            if row_number - STOCK_HEADER_ROW > MAX_SOURCE_ROWS:
                 raise InputFormatError(f"판토스 원본은 최대 {MAX_SOURCE_ROWS:,}행까지 처리할 수 있습니다.")
             summary.source_rows += 1
             raw_location = row_value(row, cols["location"])
@@ -548,6 +568,7 @@ def build_source_rows(
                 "원본 행": row_number,
             }
             global_rows.append(item)
+            summary.location_rows[location] = summary.location_rows.get(location, 0) + 1
             summary.source_quantity += available_stock
             if expiry is None:
                 summary.missing_expiry_rows += 1
@@ -565,6 +586,7 @@ def build_source_rows(
                 summary.zero_quantity_rows += 1
             if keep:
                 filtered_rows.append(item)
+                summary.kept_location_rows[location] = summary.kept_location_rows.get(location, 0) + 1
                 summary.kept_quantity += available_stock
 
         if errors:
@@ -611,26 +633,85 @@ def build_source_rows(
         wb.close()
 
 
-def apply_standard_style(ws, max_col: int, freeze_cell: str = "A2") -> None:
+def ensure_named_style(
+    wb: Workbook,
+    name: str,
+    *,
+    font: Font,
+    border: Border,
+    alignment: Alignment,
+    fill: Optional[PatternFill] = None,
+    number_format: str = "General",
+) -> str:
+    if name not in wb.named_styles:
+        wb.add_named_style(NamedStyle(
+            name=name,
+            font=font,
+            border=border,
+            alignment=alignment,
+            fill=fill or PatternFill(),
+            number_format=number_format,
+        ))
+    return name
+
+
+def format_style_name(prefix: str, column: int, number_format: str) -> str:
+    suffix = hashlib.sha1(number_format.encode("utf-8")).hexdigest()[:6]
+    return f"{prefix}_{column}_{suffix}"
+
+
+def apply_standard_style(
+    ws,
+    max_col: int,
+    freeze_cell: str = "A2",
+    number_formats: Optional[dict[int, str]] = None,
+) -> None:
     header_fill = PatternFill("solid", fgColor="1F4E78")
     header_font = Font(name="맑은 고딕", bold=True, color="FFFFFF", size=10)
     body_font = Font(name="맑은 고딕", size=10)
     side = Side(style="thin", color="D9E2F3")
     border = Border(left=side, right=side, top=side, bottom=side)
+    header_style = ensure_named_style(
+        ws.parent,
+        "InvStandardHeader",
+        font=header_font,
+        border=border,
+        alignment=Alignment(horizontal="center", vertical="center"),
+        fill=header_fill,
+    )
+    body_style = ensure_named_style(
+        ws.parent,
+        "InvStandardBody",
+        font=body_font,
+        border=border,
+        alignment=Alignment(vertical="center"),
+    )
+    formatted_styles = {
+        column: ensure_named_style(
+            ws.parent,
+            format_style_name("InvStandardBody", column, number_format),
+            font=body_font,
+            border=border,
+            alignment=Alignment(vertical="center"),
+            number_format=number_format,
+        )
+        for column, number_format in (number_formats or {}).items()
+    }
     for cell in ws[1]:
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-        cell.border = border
+        cell.style = header_style
     for row in ws.iter_rows(min_row=2, max_row=ws.max_row, max_col=max_col):
         for cell in row:
-            cell.font = body_font
-            cell.border = border
-            cell.alignment = Alignment(vertical="center")
+            cell.style = formatted_styles.get(cell.column, body_style)
     ws.freeze_panes = freeze_cell
 
 
-def style_summary_sheet(ws, max_col: int, header_row: int = 1, freeze_cell: str = "A2") -> None:
+def style_summary_sheet(
+    ws,
+    max_col: int,
+    header_row: int = 1,
+    freeze_cell: str = "A2",
+    number_formats: Optional[dict[int, str]] = None,
+) -> None:
     header_fill = PatternFill("solid", fgColor="1F4E78")
     light_fill = PatternFill("solid", fgColor="D9EAF7")
     header_font = Font(name="맑은 고딕", bold=True, color="FFFFFF", size=10)
@@ -638,21 +719,60 @@ def style_summary_sheet(ws, max_col: int, header_row: int = 1, freeze_cell: str 
     body_font = Font(name="맑은 고딕", size=10)
     side = Side(style="thin", color="D9E2F3")
     border = Border(left=side, right=side, top=side, bottom=side)
+    header_style = ensure_named_style(
+        ws.parent,
+        "InvSummaryHeader",
+        font=header_font,
+        border=border,
+        alignment=Alignment(horizontal="center", vertical="center", wrap_text=True),
+        fill=header_fill,
+    )
+    body_style = ensure_named_style(
+        ws.parent,
+        "InvSummaryBody",
+        font=body_font,
+        border=border,
+        alignment=Alignment(vertical="center", wrap_text=True),
+    )
+    formatted_styles = {
+        column: ensure_named_style(
+            ws.parent,
+            format_style_name("InvSummaryBody", column, number_format),
+            font=body_font,
+            border=border,
+            alignment=Alignment(vertical="center", wrap_text=True),
+            number_format=number_format,
+        )
+        for column, number_format in (number_formats or {}).items()
+    }
+    total_style = ensure_named_style(
+        ws.parent,
+        "InvSummaryTotal",
+        font=bold_font,
+        border=border,
+        alignment=Alignment(vertical="center", wrap_text=True),
+        fill=light_fill,
+    )
+    formatted_total_styles = {
+        column: ensure_named_style(
+            ws.parent,
+            format_style_name("InvSummaryTotal", column, number_format),
+            font=bold_font,
+            border=border,
+            alignment=Alignment(vertical="center", wrap_text=True),
+            fill=light_fill,
+            number_format=number_format,
+        )
+        for column, number_format in (number_formats or {}).items()
+    }
     for cell in ws[header_row]:
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border = border
+        cell.style = header_style
     for row in ws.iter_rows(min_row=header_row + 1, max_row=ws.max_row, max_col=max_col):
         for cell in row:
-            cell.font = body_font
-            cell.border = border
-            cell.alignment = Alignment(vertical="center", wrap_text=True)
+            cell.style = formatted_styles.get(cell.column, body_style)
     if ws.max_row > header_row and ws.cell(ws.max_row, 1).value == "총합계":
         for cell in ws[ws.max_row]:
-            cell.font = bold_font
-            cell.fill = light_fill
-            cell.border = border
+            cell.style = formatted_total_styles.get(cell.column, total_style)
     ws.freeze_panes = freeze_cell
 
 
@@ -692,21 +812,16 @@ def write_data_sheet(
         ws.cell(row_index, 8).value = item["개봉 전 사용기한(개월)"]
         write_safe_text(ws.cell(row_index, 9), item["판정"])
 
-    apply_standard_style(ws, len(headers))
+    apply_standard_style(
+        ws,
+        len(headers),
+        number_formats={4: "#,##0", 5: "yyyy-mm-dd", 7: "0.0%", 8: "0.##"},
+    )
     for col, width in {
         "A": 12, "B": 18, "C": 45, "D": 15, "E": 13,
         "F": 18, "G": 16, "H": 20, "I": 18,
     }.items():
         ws.column_dimensions[col].width = width
-    for cell in ws["D"]:
-        cell.number_format = "#,##0"
-    for cell in ws["E"]:
-        cell.number_format = "yyyy-mm-dd"
-    for cell in ws["G"]:
-        cell.number_format = "0.0%"
-    for cell in ws["H"]:
-        cell.number_format = "0"
-
     if rows:
         add_table(ws, table_name, f"A1:I{len(rows) + 1}")
         ws.conditional_formatting.add(
@@ -743,13 +858,15 @@ def product_sort_key(material: str):
     return 1, str(material)
 
 
-def write_pivot_sheet(wb: Workbook, rows: list[dict], settings: Settings) -> None:
+def write_pivot_sheet(wb: Workbook, rows: list[dict], settings: Settings) -> float:
     ws = wb.create_sheet("글로벌 pv")
     ws["A1"] = "합계 : 가용재고(ASN)"
     ws["C1"] = "저장 위치"
     headers = ["자재", "자재내역", *settings.locations, "총합계"]
     ws.append(headers)
     grouped = aggregate_by_product(rows)
+    location_totals = defaultdict(float)
+    grand_total = 0.0
     start_row = 3
     for row_number, key in enumerate(sorted(grouped, key=product_sort_key), start=start_row):
         item = grouped[key]
@@ -760,15 +877,16 @@ def write_pivot_sheet(wb: Workbook, rows: list[dict], settings: Settings) -> Non
             quantity = item["qty"].get(location, 0)
             ws.cell(row_number, column).value = int(quantity) if float(quantity).is_integer() else quantity
             total += quantity
+            location_totals[location] += quantity
         total_column = 3 + len(settings.locations)
         ws.cell(row_number, total_column).value = int(total) if float(total).is_integer() else total
+        grand_total += total
 
     total_row = start_row + len(grouped)
     ws.cell(total_row, 1).value = "총합계"
     for column, location in enumerate(settings.locations, start=3):
-        total = sum(item["qty"].get(location, 0) for item in grouped.values())
+        total = location_totals[location]
         ws.cell(total_row, column).value = int(total) if float(total).is_integer() else total
-    grand_total = sum(sum(item["qty"].values()) for item in grouped.values())
     total_column = 3 + len(settings.locations)
     ws.cell(total_row, total_column).value = int(grand_total) if float(grand_total).is_integer() else grand_total
 
@@ -779,24 +897,53 @@ def write_pivot_sheet(wb: Workbook, rows: list[dict], settings: Settings) -> Non
     for cell in ws[1]:
         cell.font, cell.fill, cell.border = bold_font, light_fill, border
 
-    style_summary_sheet(ws, len(headers), header_row=2, freeze_cell="A3")
+    style_summary_sheet(
+        ws,
+        len(headers),
+        header_row=2,
+        freeze_cell="A3",
+        number_formats={column: "#,##0" for column in range(3, len(headers) + 1)},
+    )
     ws.column_dimensions["A"].width = 18
     ws.column_dimensions["B"].width = 45
     for column in range(3, len(headers) + 1):
         letter = ws.cell(1, column).column_letter
         ws.column_dimensions[letter].width = 14
-        for cell in ws[letter]:
-            cell.number_format = "#,##0"
     if grouped:
         add_table(ws, "GlobalExpiryPVTable", f"A2:{ws.cell(2, len(headers)).column_letter}{total_row - 1}")
     else:
         ws.auto_filter.ref = f"A2:{ws.cell(2, len(headers)).column_letter}2"
+    return grand_total
 
 
-def aggregate_location_exp_rows(rows: list[dict], location: str, settings: Settings) -> list[dict]:
-    grouped: dict[tuple, dict] = {}
+def sort_location_rows(result: list[dict], settings: Settings) -> None:
+    def material_key(item: dict):
+        material = item["자재"]
+        return (0, int(material)) if str(material).isdigit() else (1, str(material))
+
+    # LOT 정렬을 먼저 적용한 뒤 나머지 기준을 하나의 안정 정렬로 묶는다.
+    result.sort(key=lambda x: x["로트번호(생산)"], reverse=not settings.lot_ascending)
+    result.sort(
+        key=lambda x: (
+            material_key(x),
+            x["EXP"] is None,
+            (x["EXP"] or date.min).toordinal() * (1 if settings.expiry_ascending else -1),
+            x["수량"] * (1 if settings.quantity_ascending else -1),
+        )
+    )
+
+
+def aggregate_all_location_exp_rows(
+    rows: list[dict],
+    settings: Settings,
+) -> dict[str, list[dict]]:
+    grouped_by_location: dict[str, dict[tuple, dict]] = {
+        location: {} for location in settings.locations
+    }
     for item in rows:
-        if item["저장 위치"] != location:
+        location = item["저장 위치"]
+        grouped = grouped_by_location.get(location)
+        if grouped is None:
             continue
         quantity = item["가용재고(ASN)"] or 0
         if quantity == 0 and not settings.include_zero_in_details:
@@ -820,35 +967,32 @@ def aggregate_location_exp_rows(rows: list[dict], location: str, settings: Setti
             grouped[key]["자재내역"] = item["자재내역"]
         grouped[key]["수량"] += quantity
 
-    result = list(grouped.values())
-
-    def base_key(item: dict):
-        material = item["자재"]
-        material_key = (0, int(material)) if str(material).isdigit() else (1, str(material))
-        return material_key, str(item["자재내역"] or "")
-
-    # 안정 정렬을 역순으로 적용해 각 기준의 오름/내림차순을 독립적으로 제어한다.
-    result.sort(key=lambda x: x["로트번호(생산)"], reverse=not settings.lot_ascending)
-    result.sort(key=lambda x: x["수량"], reverse=not settings.quantity_ascending)
-    result.sort(
-        key=lambda x: (
-            x["EXP"] is None,
-            (x["EXP"] or date.min).toordinal() * (1 if settings.expiry_ascending else -1),
-        ),
-    )
-    result.sort(key=base_key)
-    return result
+    result_by_location: dict[str, list[dict]] = {}
+    for location, grouped in grouped_by_location.items():
+        result = list(grouped.values())
+        sort_location_rows(result, settings)
+        result_by_location[location] = result
+    return result_by_location
 
 
-def write_location_sheets(wb: Workbook, rows: list[dict], settings: Settings) -> None:
+def aggregate_location_exp_rows(rows: list[dict], location: str, settings: Settings) -> list[dict]:
+    """단일 창고 호출과 기존 테스트 호환을 위한 래퍼."""
+    if location not in settings.locations:
+        return []
+    return aggregate_all_location_exp_rows(rows, settings)[location]
+
+
+def write_location_sheets(wb: Workbook, rows: list[dict], settings: Settings) -> float:
     headers = [
         "자재", "자재내역", "수량", "EXP", "잔여 유통기한율",
         "개봉 전 사용기한(개월)", "로트번호(생산)",
     ]
+    details_by_location = aggregate_all_location_exp_rows(rows, settings)
+    grand_total = 0.0
     for location in settings.locations:
         ws = wb.create_sheet(f"글로벌 유통기한 {location}")
         ws.append(headers)
-        detail_rows = aggregate_location_exp_rows(rows, location, settings)
+        detail_rows = details_by_location[location]
         for item in detail_rows:
             quantity = item["수량"]
             row_index = ws.max_row + 1
@@ -860,21 +1004,19 @@ def write_location_sheets(wb: Workbook, rows: list[dict], settings: Settings) ->
             ws.cell(row_index, 6).value = item["개봉 전 사용기한(개월)"]
             write_safe_text(ws.cell(row_index, 7), item["로트번호(생산)"])
         total_row = ws.max_row + 1
+        location_total = sum(item["수량"] for item in detail_rows)
+        grand_total += location_total
         ws.cell(total_row, 1).value = "총합계"
-        ws.cell(total_row, 3).value = sum((ws.cell(r, 3).value or 0) for r in range(2, total_row))
-        style_summary_sheet(ws, len(headers))
+        ws.cell(total_row, 3).value = location_total
+        style_summary_sheet(
+            ws,
+            len(headers),
+            number_formats={3: "#,##0", 4: "yyyy-mm-dd", 5: "0.0%", 6: "0.##"},
+        )
         for col, width in {
             "A": 18, "B": 45, "C": 14, "D": 13, "E": 16, "F": 20, "G": 28,
         }.items():
             ws.column_dimensions[col].width = width
-        for cell in ws["C"]:
-            cell.number_format = "#,##0"
-        for cell in ws["D"]:
-            cell.number_format = "yyyy-mm-dd"
-        for cell in ws["E"]:
-            cell.number_format = "0.0%"
-        for cell in ws["F"]:
-            cell.number_format = "0"
         if detail_rows:
             safe_location = re.sub(r"[^A-Za-z0-9_]", "", location)[:16] or "LOC"
             suffix = hashlib.sha1(location.encode("utf-8")).hexdigest()[:8]
@@ -889,6 +1031,7 @@ def write_location_sheets(wb: Workbook, rows: list[dict], settings: Settings) ->
             )
         else:
             ws.auto_filter.ref = "A1:G1"
+    return grand_total
 
 
 def write_meta_sheet(
@@ -904,12 +1047,6 @@ def write_meta_sheet(
     summary: ValidationSummary,
 ) -> None:
     ws = wb.create_sheet("기준_자동화")
-    counts = defaultdict(int)
-    pass_counts = defaultdict(int)
-    for item in global_rows:
-        counts[item["저장 위치"]] += 1
-    for item in filtered_rows:
-        pass_counts[item["저장 위치"]] += 1
     direction = lambda ascending: "빠른/작은 순" if ascending else "늦은/큰 순"
     meta = [
         ["항목", "값"],
@@ -932,17 +1069,16 @@ def write_meta_sheet(
         ["선택 창고 전체 수량", summary.source_quantity],
         ["유지 결과 수량", summary.kept_quantity],
         ["마스터 매칭률", summary.master_match_ratio],
-        ["원본 창고별 행 수", " / ".join(f"{loc} {counts[loc]:,}" for loc in settings.locations)],
-        ["유지 창고별 행 수", " / ".join(f"{loc} {pass_counts[loc]:,}" for loc in settings.locations)],
-        ["주의: 유통기한 없음", sum(item["유통기한"] is None for item in global_rows)],
-        ["주의: Product Master 사용기한 누락", sum(
-            item["유통기한"] is not None and item["개봉 전 사용기한(개월)"] is None
-            for item in global_rows
+        ["원본 창고별 행 수", " / ".join(
+            f"{loc} {summary.location_rows.get(loc, 0):,}" for loc in settings.locations
         )],
-        ["주의: 로트번호 없음", sum(
-            normalize_lot_number(item["로트번호(생산)"]) == "" for item in global_rows
+        ["유지 창고별 행 수", " / ".join(
+            f"{loc} {summary.kept_location_rows.get(loc, 0):,}" for loc in settings.locations
         )],
-        ["참고: 가용재고 0", sum((item["가용재고(ASN)"] or 0) == 0 for item in global_rows)],
+        ["주의: 유통기한 없음", summary.missing_expiry_rows],
+        ["주의: Product Master 사용기한 누락", summary.missing_master_rows],
+        ["주의: 로트번호 없음", summary.missing_lot_rows],
+        ["참고: 가용재고 0", summary.zero_quantity_rows],
         ["생성 앱 버전", APP_VERSION],
     ]
     for row in meta:
@@ -1010,6 +1146,11 @@ def validate_output_workbook(
         *(f"글로벌 유통기한 {location}" for location in settings.locations),
         "검증결과", "기준_자동화",
     ]
+    with ZipFile(io.BytesIO(output_bytes)) as archive:
+        required_parts = {"[Content_Types].xml", "xl/workbook.xml"}
+        if not required_parts.issubset(archive.namelist()):
+            raise RuntimeError("출력 XLSX의 필수 구성요소가 누락되었습니다.")
+
     wb = load_workbook(io.BytesIO(output_bytes), data_only=True, read_only=True)
     try:
         if wb.sheetnames != expected_sheets:
@@ -1019,19 +1160,10 @@ def validate_output_workbook(
         if wb["글로벌 유통기한"].max_row - 1 != len(filtered_rows):
             raise RuntimeError("글로벌 유통기한 시트 행 수 검증에 실패했습니다.")
 
-        expected_total = sum(item["가용재고(ASN)"] for item in filtered_rows)
-        pivot = wb["글로벌 pv"]
-        pivot_total = pivot.cell(pivot.max_row, 3 + len(settings.locations)).value or 0
-        detail_total = 0
-        for location in settings.locations:
-            ws = wb[f"글로벌 유통기한 {location}"]
-            detail_total += ws.cell(ws.max_row, 3).value or 0
-        if not math.isclose(float(pivot_total), float(expected_total), abs_tol=1e-9):
-            raise RuntimeError("피벗 총수량 대사에 실패했습니다.")
-        if not math.isclose(float(detail_total), float(expected_total), abs_tol=1e-9):
-            raise RuntimeError("창고별 상세 총수량 대사에 실패했습니다.")
         if global_rows and (wb["글로벌"]["G2"].value != global_rows[0]["잔여 유통기한율"]):
             raise RuntimeError("잔여 유통기한율 저장값 검증에 실패했습니다.")
+        if global_rows and wb["글로벌"]["I2"].value != global_rows[0]["판정"]:
+            raise RuntimeError("판정 저장값 검증에 실패했습니다.")
     finally:
         wb.close()
 
@@ -1051,19 +1183,25 @@ def create_inventory_workbook(
     global_rows, filtered_rows = build_source_rows(pantos_bytes, lifetime_map, base, settings, summary)
 
     wb = Workbook()
-    wb.remove(wb.active)
-    write_data_sheet(wb, "글로벌", global_rows, settings, "GlobalInventoryTable")
-    write_data_sheet(wb, "글로벌 유통기한", filtered_rows, settings, "GlobalExpiryDataTable")
-    write_pivot_sheet(wb, filtered_rows, settings)
-    write_location_sheets(wb, filtered_rows, settings)
-    write_validation_sheet(wb, summary)
-    write_meta_sheet(
-        wb, pantos_name, master_name, base, base_source, filename_date,
-        global_rows, filtered_rows, settings, summary,
-    )
-    output = io.BytesIO()
-    wb.save(output)
-    wb.close()
+    try:
+        wb.remove(wb.active)
+        write_data_sheet(wb, "글로벌", global_rows, settings, "GlobalInventoryTable")
+        write_data_sheet(wb, "글로벌 유통기한", filtered_rows, settings, "GlobalExpiryDataTable")
+        pivot_total = write_pivot_sheet(wb, filtered_rows, settings)
+        detail_total = write_location_sheets(wb, filtered_rows, settings)
+        if not math.isclose(float(pivot_total), float(summary.kept_quantity), abs_tol=1e-9):
+            raise RuntimeError("피벗 총수량 대사에 실패했습니다.")
+        if not math.isclose(float(detail_total), float(summary.kept_quantity), abs_tol=1e-9):
+            raise RuntimeError("창고별 상세 총수량 대사에 실패했습니다.")
+        write_validation_sheet(wb, summary)
+        write_meta_sheet(
+            wb, pantos_name, master_name, base, base_source, filename_date,
+            global_rows, filtered_rows, settings, summary,
+        )
+        output = io.BytesIO()
+        wb.save(output)
+    finally:
+        wb.close()
     output_bytes = output.getvalue()
     validate_output_workbook(output_bytes, global_rows, filtered_rows, settings)
     return output_bytes, global_rows, filtered_rows, summary
@@ -1116,46 +1254,64 @@ def result_signature(
 def render_sidebar() -> dict[str, Any]:
     with st.sidebar:
         st.header("생성 기준")
-        base_mode = st.radio("기준일", ["자동", "직접 지정"], horizontal=True)
-        manual_date = st.date_input("직접 기준일", value=today_kst(), disabled=base_mode != "직접 지정")
-        threshold_percent = st.number_input(
-            "잔여 유통기한 통과율 (%)", min_value=0.0, max_value=100.0,
-            value=66.0, step=1.0,
-        )
-        location_text = st.text_input("대상 창고 및 순서", value="DU, GD, GL")
-
-        st.subheader("예외 처리")
-        keep_missing_expiry = st.checkbox("유통기한 없는 재고 유지", value=True)
-        keep_missing_master = st.checkbox("마스터 사용기한 누락 재고 유지", value=True)
-        include_zero = st.checkbox("창고별 상세에 0재고 표시", value=False)
-
-        st.subheader("창고별 상세 정렬")
-        expiry_order = st.selectbox("EXP", ["빠른 순", "늦은 순"])
-        quantity_order = st.selectbox("동일 EXP 내 수량", ["적은 순", "많은 순"])
-        lot_order = st.selectbox("동일 조건 내 LOT", ["오름차순", "내림차순"])
-
-        with st.expander("자동 기준일 상세"):
-            fallback_year = st.number_input(
-                "파일명이 MMDD일 때 연도", min_value=2000, max_value=2100,
-                value=today_kst().year, step=1,
+        st.caption("옵션을 변경한 뒤 아래 적용 버튼을 눌러 주세요.")
+        with st.form("inventory_options_form", clear_on_submit=False):
+            base_mode = st.radio("기준일", ["자동", "직접 지정"], horizontal=True)
+            manual_date = st.date_input(
+                "직접 기준일",
+                value=today_kst(),
+                help="기준일이 '자동'이면 이 값은 사용하지 않습니다.",
             )
-            split_day = st.number_input(
-                "전반기 기준일", min_value=1, max_value=28, value=15, step=1,
-                help="파일 날짜가 이 날짜 이하면 해당 날짜, 이후면 월말을 기준일로 사용합니다.",
+            threshold_percent = st.number_input(
+                "잔여 유통기한 통과율 (%)", min_value=0.0, max_value=100.0,
+                value=66.0, step=1.0,
             )
-            reuse_existing = st.checkbox("기존 글로벌 시트 G1 기준일 우선 사용", value=True)
+            location_text = st.text_input("대상 창고 및 순서", value="GD, DU, GL")
 
-        with st.expander("입력 시트·열 이름"):
-            stock_sheet = st.text_input("판토스 원본 시트", value="Sheet1")
-            master_sheet = st.text_input("Product Master 시트", value="유효기간")
-            location_col = st.text_input("창고 열", value="저장 위치")
-            material_col = st.text_input("자재 열", value="자재")
-            product_col = st.text_input("제품명 열", value="자재내역")
-            stock_col = st.text_input("가용재고 열", value="가용재고(ASN)")
-            expiry_col = st.text_input("유통기한 열", value="유통기한")
-            lot_col = st.text_input("LOT 열", value="로트번호(생산)")
-            barcode_col = st.text_input("마스터 바코드 열", value="바코드")
-            months_col = st.text_input("마스터 사용기한 열", value="개봉 전 사용기한")
+            st.subheader("예외 처리")
+            keep_missing_expiry = st.checkbox("유통기한 없는 재고 유지", value=True)
+            keep_missing_master = st.checkbox("마스터 사용기한 누락 재고 유지", value=True)
+            include_zero = st.checkbox("창고별 상세에 0재고 표시", value=False)
+
+            st.subheader("창고별 상세 정렬")
+            expiry_order = st.selectbox("EXP", ["빠른 순", "늦은 순"])
+            quantity_order = st.selectbox("동일 EXP 내 수량", ["적은 순", "많은 순"])
+            lot_order = st.selectbox("동일 조건 내 LOT", ["오름차순", "내림차순"])
+
+            with st.expander("자동 기준일 상세"):
+                fallback_year = st.number_input(
+                    "파일명이 MMDD일 때 연도", min_value=2000, max_value=2100,
+                    value=today_kst().year, step=1,
+                )
+                split_day = st.number_input(
+                    "전반기 기준일", min_value=1, max_value=28, value=15, step=1,
+                    help="파일 날짜가 이 날짜 이하면 해당 날짜, 이후면 월말을 기준일로 사용합니다.",
+                )
+                reuse_existing = st.checkbox("기존 글로벌 시트 G1 기준일 우선 사용", value=True)
+
+            with st.expander("입력 시트·열 이름"):
+                stock_sheet = st.text_input("판토스 원본 시트", value="Sheet1")
+                master_sheet = st.text_input("Product Master 시트", value="유효기간")
+                st.caption("판토스 열 제목은 1행, Product Master 열 제목은 12행에서 인식합니다.")
+                location_col = st.text_input("창고 열", value="저장 위치")
+                material_col = st.text_input("자재 열", value="자재")
+                product_col = st.text_input("제품명 열", value="자재내역")
+                stock_col = st.text_input("가용재고 열", value="가용재고(ASN)")
+                expiry_col = st.text_input("유통기한 열", value="유통기한")
+                lot_col = st.text_input("LOT 열", value="로트번호(생산)")
+                barcode_col = st.text_input("마스터 바코드 열", value="바코드")
+                months_col = st.text_input("마스터 사용기한 열", value="개봉 전 사용기한")
+
+            st.subheader("출력")
+            output_name = st.text_input("결과 파일명", value="글로벌재고_자동생성.xlsx")
+            options_submitted = st.form_submit_button(
+                "옵션 적용",
+                type="primary",
+                width="stretch",
+            )
+
+        if options_submitted:
+            st.success("옵션이 적용되었습니다.")
 
     return {
         "base_mode": base_mode,
@@ -1173,6 +1329,7 @@ def render_sidebar() -> dict[str, Any]:
         "reuse_existing": reuse_existing,
         "stock_sheet": stock_sheet.strip(),
         "master_sheet": master_sheet.strip(),
+        "output_name": output_name,
         "columns": ColumnNames(
             location=location_col, material=material_col, product_name=product_col,
             available_stock=stock_col, expiry=expiry_col, lot_no=lot_col,
@@ -1192,7 +1349,7 @@ def main() -> None:
     with right:
         master_file = st.file_uploader("Product Master", type=["xlsx"], key="master")
 
-    output_name = st.text_input("결과 파일명", value="글로벌재고_자동생성.xlsx")
+    output_name = controls["output_name"]
 
     if not pantos_file or not master_file:
         st.info("두 엑셀 파일을 업로드하면 재고 파일을 생성할 수 있습니다.")
@@ -1259,12 +1416,20 @@ def main() -> None:
         st.warning("파일명에서 날짜를 찾지 못해 한국시간 오늘 날짜로 기준일을 계산했습니다.")
 
     confirmation_key = f"base_confirmed_{base.isoformat()}_{hashlib.sha1(base_source.encode()).hexdigest()[:8]}"
-    base_confirmed = st.checkbox(
-        f"기준일 {base:%Y-%m-%d}을 확인했습니다.",
-        key=confirmation_key,
-    )
+    with st.form("inventory_generation_form", clear_on_submit=False):
+        base_confirmed = st.checkbox(
+            f"기준일 {base:%Y-%m-%d}을 확인했습니다.",
+            key=confirmation_key,
+        )
+        generate_submitted = st.form_submit_button(
+            "재고 파일 만들기",
+            type="primary",
+            width="stretch",
+        )
 
-    if st.button("재고 파일 만들기", type="primary", width="stretch", disabled=not base_confirmed):
+    if generate_submitted and not base_confirmed:
+        st.error("표시된 기준일을 확인한 뒤 체크해 주세요.")
+    elif generate_submitted:
         try:
             with st.spinner("재고 데이터를 처리하고 있습니다..."):
                 output_bytes, global_rows, filtered_rows, summary = create_inventory_workbook(
@@ -1315,6 +1480,7 @@ def main() -> None:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
             width="stretch",
+            on_click="ignore",
         )
         with st.expander("결과 미리보기 (최대 100행)"):
             preview = []
