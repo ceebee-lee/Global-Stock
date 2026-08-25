@@ -21,7 +21,7 @@ from openpyxl.styles import Alignment, Border, Font, NamedStyle, PatternFill, Si
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_SOURCE_ROWS = 200_000
 MAX_VALIDATION_MESSAGES = 100
@@ -146,6 +146,14 @@ def normalize_lot_number(value: Any) -> str:
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return str(value).strip()
+
+
+def make_batch_number(expiry: Optional[date], lot_no: Any) -> Optional[str]:
+    """유통기한과 LOT가 모두 있을 때 YYYYMMDD|LOT 형식의 배치번호를 만든다."""
+    normalized_lot = normalize_lot_number(lot_no)
+    if expiry is None or not normalized_lot:
+        return None
+    return f"{expiry:%Y%m%d}|{normalized_lot}"
 
 
 def find_required_columns(
@@ -562,6 +570,7 @@ def build_source_rows(
                 "가용재고(ASN)": available_stock,
                 "유통기한": expiry,
                 "로트번호(생산)": lot_no,
+                "배치번호": make_batch_number(expiry, lot_no),
                 "잔여 유통기한율": ratio,
                 "개봉 전 사용기한(개월)": lifetime,
                 "판정": status,
@@ -798,7 +807,7 @@ def write_data_sheet(
     ws = wb.create_sheet(title)
     headers = [
         "저장 위치", "자재", "자재내역", "가용재고(ASN)", "유통기한", "로트번호(생산)",
-        "잔여 유통기한율", "개봉 전 사용기한(개월)", "판정",
+        "배치번호", "잔여 유통기한율", "개봉 전 사용기한(개월)", "판정",
     ]
     ws.append(headers)
     for row_index, item in enumerate(rows, start=2):
@@ -808,24 +817,28 @@ def write_data_sheet(
         ws.cell(row_index, 4).value = item["가용재고(ASN)"]
         ws.cell(row_index, 5).value = item["유통기한"]
         write_safe_text(ws.cell(row_index, 6), item["로트번호(생산)"])
-        ws.cell(row_index, 7).value = item["잔여 유통기한율"]
-        ws.cell(row_index, 8).value = item["개봉 전 사용기한(개월)"]
-        write_safe_text(ws.cell(row_index, 9), item["판정"])
+        write_safe_text(
+            ws.cell(row_index, 7),
+            item.get("배치번호") or make_batch_number(item["유통기한"], item["로트번호(생산)"]),
+        )
+        ws.cell(row_index, 8).value = item["잔여 유통기한율"]
+        ws.cell(row_index, 9).value = item["개봉 전 사용기한(개월)"]
+        write_safe_text(ws.cell(row_index, 10), item["판정"])
 
     apply_standard_style(
         ws,
         len(headers),
-        number_formats={4: "#,##0", 5: "yyyy-mm-dd", 7: "0.0%", 8: "0.##"},
+        number_formats={4: "#,##0", 5: "yyyy-mm-dd", 8: "0.0%", 9: "0.##"},
     )
     for col, width in {
         "A": 12, "B": 18, "C": 45, "D": 15, "E": 13,
-        "F": 18, "G": 16, "H": 20, "I": 18,
+        "F": 18, "G": 30, "H": 16, "I": 20, "J": 18,
     }.items():
         ws.column_dimensions[col].width = width
     if rows:
-        add_table(ws, table_name, f"A1:I{len(rows) + 1}")
+        add_table(ws, table_name, f"A1:J{len(rows) + 1}")
         ws.conditional_formatting.add(
-            f"G2:G{len(rows) + 1}",
+            f"H2:H{len(rows) + 1}",
             CellIsRule(
                 operator="lessThan",
                 formula=[str(settings.pass_threshold)],
@@ -833,7 +846,7 @@ def write_data_sheet(
             ),
         )
     else:
-        ws.auto_filter.ref = "A1:I1"
+        ws.auto_filter.ref = "A1:J1"
 
 
 def aggregate_by_product(rows: Iterable[dict]) -> dict[str, dict]:
@@ -962,6 +975,7 @@ def aggregate_all_location_exp_rows(
                 "잔여 유통기한율": item["잔여 유통기한율"],
                 "개봉 전 사용기한(개월)": item["개봉 전 사용기한(개월)"],
                 "로트번호(생산)": lot_no,
+                "배치번호": make_batch_number(item["유통기한"], lot_no),
             }
         elif not grouped[key]["자재내역"] and item["자재내역"]:
             grouped[key]["자재내역"] = item["자재내역"]
@@ -985,7 +999,7 @@ def aggregate_location_exp_rows(rows: list[dict], location: str, settings: Setti
 def write_location_sheets(wb: Workbook, rows: list[dict], settings: Settings) -> float:
     headers = [
         "자재", "자재내역", "수량", "EXP", "잔여 유통기한율",
-        "개봉 전 사용기한(개월)", "로트번호(생산)",
+        "개봉 전 사용기한(개월)", "로트번호(생산)", "배치번호",
     ]
     details_by_location = aggregate_all_location_exp_rows(rows, settings)
     grand_total = 0.0
@@ -1003,6 +1017,7 @@ def write_location_sheets(wb: Workbook, rows: list[dict], settings: Settings) ->
             ws.cell(row_index, 5).value = item["잔여 유통기한율"]
             ws.cell(row_index, 6).value = item["개봉 전 사용기한(개월)"]
             write_safe_text(ws.cell(row_index, 7), item["로트번호(생산)"])
+            write_safe_text(ws.cell(row_index, 8), item["배치번호"])
         total_row = ws.max_row + 1
         location_total = sum(item["수량"] for item in detail_rows)
         grand_total += location_total
@@ -1014,13 +1029,13 @@ def write_location_sheets(wb: Workbook, rows: list[dict], settings: Settings) ->
             number_formats={3: "#,##0", 4: "yyyy-mm-dd", 5: "0.0%", 6: "0.##"},
         )
         for col, width in {
-            "A": 18, "B": 45, "C": 14, "D": 13, "E": 16, "F": 20, "G": 28,
+            "A": 18, "B": 45, "C": 14, "D": 13, "E": 16, "F": 20, "G": 28, "H": 30,
         }.items():
             ws.column_dimensions[col].width = width
         if detail_rows:
             safe_location = re.sub(r"[^A-Za-z0-9_]", "", location)[:16] or "LOC"
             suffix = hashlib.sha1(location.encode("utf-8")).hexdigest()[:8]
-            add_table(ws, f"T_{safe_location}_{suffix}", f"A1:G{total_row - 1}")
+            add_table(ws, f"T_{safe_location}_{suffix}", f"A1:H{total_row - 1}")
             ws.conditional_formatting.add(
                 f"E2:E{total_row - 1}",
                 CellIsRule(
@@ -1030,7 +1045,7 @@ def write_location_sheets(wb: Workbook, rows: list[dict], settings: Settings) ->
                 ),
             )
         else:
-            ws.auto_filter.ref = "A1:G1"
+            ws.auto_filter.ref = "A1:H1"
     return grand_total
 
 
@@ -1160,10 +1175,22 @@ def validate_output_workbook(
         if wb["글로벌 유통기한"].max_row - 1 != len(filtered_rows):
             raise RuntimeError("글로벌 유통기한 시트 행 수 검증에 실패했습니다.")
 
-        if global_rows and (wb["글로벌"]["G2"].value != global_rows[0]["잔여 유통기한율"]):
+        if global_rows and wb["글로벌"]["G2"].value != global_rows[0]["배치번호"]:
+            raise RuntimeError("배치번호 저장값 검증에 실패했습니다.")
+        if global_rows and (wb["글로벌"]["H2"].value != global_rows[0]["잔여 유통기한율"]):
             raise RuntimeError("잔여 유통기한율 저장값 검증에 실패했습니다.")
-        if global_rows and wb["글로벌"]["I2"].value != global_rows[0]["판정"]:
+        if global_rows and wb["글로벌"]["J2"].value != global_rows[0]["판정"]:
             raise RuntimeError("판정 저장값 검증에 실패했습니다.")
+        if filtered_rows and wb["글로벌 유통기한"]["G2"].value != filtered_rows[0]["배치번호"]:
+            raise RuntimeError("글로벌 유통기한 배치번호 저장값 검증에 실패했습니다.")
+
+        detail_rows_by_location = aggregate_all_location_exp_rows(filtered_rows, settings)
+        for location, detail_rows in detail_rows_by_location.items():
+            if not detail_rows:
+                continue
+            sheet_name = f"글로벌 유통기한 {location}"
+            if wb[sheet_name]["H2"].value != detail_rows[0]["배치번호"]:
+                raise RuntimeError(f"{sheet_name} 배치번호 저장값 검증에 실패했습니다.")
     finally:
         wb.close()
 
