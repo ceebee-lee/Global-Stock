@@ -21,7 +21,7 @@ from openpyxl.styles import Alignment, Border, Font, NamedStyle, PatternFill, Si
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 
-APP_VERSION = "1.4.3"
+APP_VERSION = "1.4.4"
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_SOURCE_ROWS = 200_000
 MAX_VALIDATION_MESSAGES = 100
@@ -826,8 +826,8 @@ def write_data_sheet(
 ) -> None:
     ws = wb.create_sheet(title)
     headers = [
-        "저장 위치", "자재", "자재내역", "가용재고(ASN)", "유통기한", "제조일자",
-        "로트번호(생산)", "배치번호", "잔여 유통기한율", "개봉 전 사용기한(개월)", "판정",
+        "저장 위치", "자재", "자재내역", "가용재고(ASN)", "유통기한", "로트번호(생산)",
+        "배치번호", "제조일자", "잔여 유통기한율", "개봉 전 사용기한(개월)", "판정",
     ]
     ws.append(headers)
     for row_index, item in enumerate(rows, start=2):
@@ -836,12 +836,12 @@ def write_data_sheet(
         write_safe_text(ws.cell(row_index, 3), item["자재내역"])
         ws.cell(row_index, 4).value = item["가용재고(ASN)"]
         ws.cell(row_index, 5).value = item["유통기한"]
-        ws.cell(row_index, 6).value = item["제조일자"]
-        write_safe_text(ws.cell(row_index, 7), item["로트번호(생산)"])
+        write_safe_text(ws.cell(row_index, 6), item["로트번호(생산)"])
         write_safe_text(
-            ws.cell(row_index, 8),
+            ws.cell(row_index, 7),
             item.get("배치번호") or make_batch_number(item["유통기한"], item["로트번호(생산)"]),
         )
+        ws.cell(row_index, 8).value = item["제조일자"]
         ws.cell(row_index, 9).value = item["잔여 유통기한율"]
         ws.cell(row_index, 10).value = item["개봉 전 사용기한(개월)"]
         write_safe_text(ws.cell(row_index, 11), item["판정"])
@@ -850,12 +850,12 @@ def write_data_sheet(
         ws,
         len(headers),
         number_formats={
-            4: "#,##0", 5: "yyyy-mm-dd", 6: "yyyy-mm-dd", 9: "0.0%", 10: "0.##",
+            4: "#,##0", 5: "yyyy-mm-dd", 8: "yyyy-mm-dd", 9: "0.0%", 10: "0.##",
         },
     )
     for col, width in {
         "A": 12, "B": 18, "C": 45, "D": 15, "E": 13,
-        "F": 13, "G": 18, "H": 30, "I": 16, "J": 20, "K": 18,
+        "F": 18, "G": 30, "H": 13, "I": 16, "J": 20, "K": 18,
     }.items():
         ws.column_dimensions[col].width = width
     if rows:
@@ -1205,9 +1205,9 @@ def validate_output_workbook(
         if wb["글로벌 유통기한"].max_row - 1 != len(filtered_rows):
             raise RuntimeError("글로벌 유통기한 시트 행 수 검증에 실패했습니다.")
 
-        if global_rows and to_date_only(wb["글로벌"]["F2"].value) != global_rows[0]["제조일자"]:
+        if global_rows and to_date_only(wb["글로벌"]["H2"].value) != global_rows[0]["제조일자"]:
             raise RuntimeError("제조일자 저장값 검증에 실패했습니다.")
-        if global_rows and wb["글로벌"]["H2"].value != global_rows[0]["배치번호"]:
+        if global_rows and wb["글로벌"]["G2"].value != global_rows[0]["배치번호"]:
             raise RuntimeError("배치번호 저장값 검증에 실패했습니다.")
         if global_rows and (wb["글로벌"]["I2"].value != global_rows[0]["잔여 유통기한율"]):
             raise RuntimeError("잔여 유통기한율 저장값 검증에 실패했습니다.")
@@ -1215,10 +1215,10 @@ def validate_output_workbook(
             raise RuntimeError("판정 저장값 검증에 실패했습니다.")
         if (
             filtered_rows
-            and to_date_only(wb["글로벌 유통기한"]["F2"].value) != filtered_rows[0]["제조일자"]
+            and to_date_only(wb["글로벌 유통기한"]["H2"].value) != filtered_rows[0]["제조일자"]
         ):
             raise RuntimeError("글로벌 유통기한 제조일자 저장값 검증에 실패했습니다.")
-        if filtered_rows and wb["글로벌 유통기한"]["H2"].value != filtered_rows[0]["배치번호"]:
+        if filtered_rows and wb["글로벌 유통기한"]["G2"].value != filtered_rows[0]["배치번호"]:
             raise RuntimeError("글로벌 유통기한 배치번호 저장값 검증에 실패했습니다.")
 
         detail_rows_by_location = aggregate_all_location_exp_rows(filtered_rows, settings)
