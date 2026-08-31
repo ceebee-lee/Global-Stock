@@ -21,7 +21,7 @@ from openpyxl.styles import Alignment, Border, Font, NamedStyle, PatternFill, Si
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 
-APP_VERSION = "1.4.4"
+APP_VERSION = "1.5.0"
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_SOURCE_ROWS = 200_000
 MAX_VALIDATION_MESSAGES = 100
@@ -894,8 +894,15 @@ def product_sort_key(material: str):
     return 1, str(material)
 
 
-def write_pivot_sheet(wb: Workbook, rows: list[dict], settings: Settings) -> float:
-    ws = wb.create_sheet("글로벌 pv")
+def write_pivot_sheet(
+    wb: Workbook,
+    rows: list[dict],
+    settings: Settings,
+    *,
+    title: str,
+    table_name: str,
+) -> float:
+    ws = wb.create_sheet(title)
     ws["A1"] = "합계 : 가용재고(ASN)"
     ws["C1"] = "저장 위치"
     headers = ["자재", "자재내역", *settings.locations, "총합계"]
@@ -946,7 +953,7 @@ def write_pivot_sheet(wb: Workbook, rows: list[dict], settings: Settings) -> flo
         letter = ws.cell(1, column).column_letter
         ws.column_dimensions[letter].width = 14
     if grouped:
-        add_table(ws, "GlobalExpiryPVTable", f"A2:{ws.cell(2, len(headers)).column_letter}{total_row - 1}")
+        add_table(ws, table_name, f"A2:{ws.cell(2, len(headers)).column_letter}{total_row - 1}")
     else:
         ws.auto_filter.ref = f"A2:{ws.cell(2, len(headers)).column_letter}2"
     return grand_total
@@ -1187,7 +1194,7 @@ def validate_output_workbook(
     settings: Settings,
 ) -> None:
     expected_sheets = [
-        "글로벌", "글로벌 유통기한", "글로벌 pv",
+        "글로벌", "글로벌 PV", "글로벌 유통기한", "글로벌 유통기한 PV",
         *(f"글로벌 유통기한 {location}" for location in settings.locations),
         "검증결과", "기준_자동화",
     ]
@@ -1204,6 +1211,22 @@ def validate_output_workbook(
             raise RuntimeError("글로벌 시트 행 수 검증에 실패했습니다.")
         if wb["글로벌 유통기한"].max_row - 1 != len(filtered_rows):
             raise RuntimeError("글로벌 유통기한 시트 행 수 검증에 실패했습니다.")
+
+        pivot_total_column = 3 + len(settings.locations)
+        global_pivot_total = wb["글로벌 PV"].cell(
+            wb["글로벌 PV"].max_row,
+            pivot_total_column,
+        ).value or 0
+        expiry_pivot_total = wb["글로벌 유통기한 PV"].cell(
+            wb["글로벌 유통기한 PV"].max_row,
+            pivot_total_column,
+        ).value or 0
+        expected_global_total = sum(item["가용재고(ASN)"] or 0 for item in global_rows)
+        expected_expiry_total = sum(item["가용재고(ASN)"] or 0 for item in filtered_rows)
+        if not math.isclose(float(global_pivot_total), float(expected_global_total), abs_tol=1e-9):
+            raise RuntimeError("글로벌 PV 저장 후 총수량 대사에 실패했습니다.")
+        if not math.isclose(float(expiry_pivot_total), float(expected_expiry_total), abs_tol=1e-9):
+            raise RuntimeError("글로벌 유통기한 PV 저장 후 총수량 대사에 실패했습니다.")
 
         if global_rows and to_date_only(wb["글로벌"]["H2"].value) != global_rows[0]["제조일자"]:
             raise RuntimeError("제조일자 저장값 검증에 실패했습니다.")
@@ -1252,11 +1275,26 @@ def create_inventory_workbook(
     try:
         wb.remove(wb.active)
         write_data_sheet(wb, "글로벌", global_rows, settings, "GlobalInventoryTable")
+        global_pivot_total = write_pivot_sheet(
+            wb,
+            global_rows,
+            settings,
+            title="글로벌 PV",
+            table_name="GlobalInventoryPVTable",
+        )
         write_data_sheet(wb, "글로벌 유통기한", filtered_rows, settings, "GlobalExpiryDataTable")
-        pivot_total = write_pivot_sheet(wb, filtered_rows, settings)
+        expiry_pivot_total = write_pivot_sheet(
+            wb,
+            filtered_rows,
+            settings,
+            title="글로벌 유통기한 PV",
+            table_name="GlobalExpiryPVTable",
+        )
         detail_total = write_location_sheets(wb, filtered_rows, settings)
-        if not math.isclose(float(pivot_total), float(summary.kept_quantity), abs_tol=1e-9):
-            raise RuntimeError("피벗 총수량 대사에 실패했습니다.")
+        if not math.isclose(float(global_pivot_total), float(summary.source_quantity), abs_tol=1e-9):
+            raise RuntimeError("글로벌 PV 총수량 대사에 실패했습니다.")
+        if not math.isclose(float(expiry_pivot_total), float(summary.kept_quantity), abs_tol=1e-9):
+            raise RuntimeError("글로벌 유통기한 PV 총수량 대사에 실패했습니다.")
         if not math.isclose(float(detail_total), float(summary.kept_quantity), abs_tol=1e-9):
             raise RuntimeError("창고별 상세 총수량 대사에 실패했습니다.")
         write_validation_sheet(wb, summary)
